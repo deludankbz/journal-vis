@@ -1,4 +1,19 @@
-import os, glob, json, webbrowser, tempfile, time
+import http.server
+import socketserver
+import threading
+import glob
+import json
+import re
+import tempfile
+import webbrowser
+import os
+from functools import partial
+import signal
+import sys
+
+from time import sleep
+from pathlib import Path
+from functools import partial
 
 # NOTE: Fix '/' and '\' pathing for multi os support
 # NOTE: Improve pathing
@@ -12,12 +27,15 @@ import os, glob, json, webbrowser, tempfile, time
 # TODO: Basic support for page padding and better bg colors
 
 
+class TCPServerReuse(socketserver.TCPServer):
+    allow_reuse_address = True
+
 class Browser:
     def __init__(self, htmlContent, styleSheet, address, moduleId) -> None:
-
         self.styleSheet = styleSheet
         self.address = address
-        self.deleteTemp = False
+        self.deleteTemp = True
+        self.port = 1200
 
         self.genTemp = self.makeTempFiles(
             htmlContent,
@@ -25,48 +43,59 @@ class Browser:
             moduleId
         )
 
-        webbrowser.open(f"file://{self.genTemp['html']}")
-        time.sleep(5)
-        self.cleanTemp(self.genTemp)
-        
-        pass
+        handler = partial(http.server.SimpleHTTPRequestHandler, directory=self.address)
+        self.httpd = TCPServerReuse(("", self.port), handler)
+
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        webbrowser.open(f"http://localhost:{self.port}/{os.path.basename(self.genTemp['html'])}")
+
+        print(f"Serving on http://localhost:{self.port}/ (Press Ctrl+C to stop)")
+
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.pause()
+
+
+    def signal_handler(self, signum, frame):
+        print("\nShutting down server...")
+        self.cleanTemp(self, self.genTemp)
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        sys.exit(0)
 
 
     def makeTempFiles(self, htmlContent, styleSheet, moduleId):
-        with tempfile.NamedTemporaryFile('w', delete=self.deleteTemp, suffix='.css', dir=self.address) as f:
+        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.css', dir=self.address) as f:
             tempStyleRef = f.name
             f.write(styleSheet)
 
-        with tempfile.NamedTemporaryFile('w', delete=self.deleteTemp, suffix='.html', dir=self.address) as f:
+        with tempfile.NamedTemporaryFile('w', delete=False, suffix='.html', dir=self.address) as f:
             tempHtmlContent = f.name
-            f.write(self.packHtml(htmlContent, tempStyleRef, moduleId))
+            f.write(self.packHtml(htmlContent, os.path.relpath(tempStyleRef, self.address), moduleId))
 
         files = {
             "html": tempHtmlContent,
             "css": tempStyleRef
         }
+
+        print(files['css'])
+
         return files
 
 
     def packHtml(self, pages, styleSheet, moduleId) -> str:
-        # TODO: Replace this coriolis-tgd-core by the module id
+        pages = pages.replace(f'src="modules/{moduleId}/', 'src="')
+        pages = pages.replace(f'src="/modules/{moduleId}/', 'src="')
+        pages = pages.replace(f'url(modules/{moduleId}/', 'url(')
+
         final = f"""
         <html>
         <head>
-            <title>Test</title>
+            <title>{moduleId}</title>
             <link rel="stylesheet" href="{styleSheet}">
-            <style>
-                
-                .wrapper {{
-                    min-width: 45rem;
-                    max-width: 60rem;
-                    margin: 0 auto;
-                }}
-            </style>
         </head>
         <body >
-            <div class="wrapper">
-                {pages.replace(f'src="modules/{moduleId}/', 'src="')}
+            <div class="jvis-wrapper">
+                {pages}
             </div>
         </body>
         </html>
@@ -74,19 +103,24 @@ class Browser:
         return final
     
     @classmethod
-    def cleanTemp(cls, cleanTargets) -> None:
-        for f in cleanTargets.values():
-            os.remove(f)
+    def cleanTemp(cls, self, cleanTargets) -> None:
+        if self.deleteTemp:
+            for f in cleanTargets.values():
+                os.remove(f)
 
-        print("Cleaned temp files!")
+            print("Cleaned temp files!")
         pass
+
 
 class IO:
     def __init__(self) -> None:
         self.cwd = os.getcwd()
+        self.absolutePath = Path(__file__).resolve().parent
+
         self.journalPath = os.path.join(self.cwd, "src", "packs", "**", "*.json")
         self.moduleInfo = os.path.join(self.cwd, "module.json")
 
+        self.baseCss = os.path.join(self.absolutePath, "css/base.css")
         self.cssRef = self.getStyleRef()
 
         pass
@@ -109,10 +143,18 @@ class IO:
         return cssRef
 
     def getStyleRefContent(self) -> str:
+        print(self.baseCss)
+        with open(self.baseCss, 'r', encoding='utf-8') as baseCss:
+            baseCssRef = baseCss.read()
+
         with open(self.cssRef, 'r', encoding='utf-8') as css:
             cssRef = css.read()
+            # TODO: Fix this please
+            cssRef = cssRef.replace('../', '')
+            cssRef = baseCssRef + cssRef
 
         return cssRef
+
 
 class JournalVis:
     def __init__(self, sourcePaths) -> None:
@@ -129,6 +171,13 @@ class JournalVis:
 
         pass
 
+
+    def removeEnrichers(self, content):
+        # final = content
+        final = re.sub(r'@UUID\[.*?\]\{(.*?)\}', r'<a class="content-link">\1</a>', content)
+        # final = re.sub(r'\[\[/r\s(.*?)\]\]', r'<a class="inline-roll roll">\1</a>', content)
+        return final
+
     def sortElements(self, elements: list[dict]) -> list[dict]:
         """Sort elements of list of dicts by value of 'sort' key."""
         return sorted(elements, key=lambda x: x['sort'])
@@ -138,13 +187,15 @@ class JournalVis:
             self.allPages.extend(f['pages'])
         
         # NOTE: not great. but fuck you LMAO GOTTEM.
-        oTag = '<div class="sheet"><section class="journal-entry-content"><div class="journal-entry-pages"><article class="journal-entry-page"><section class="journal-page-content">'
-        cTag = '</div></section></article></div></section>'
+        oTag = '<div class="sheet journal-entry"> <section class="journal-entry-content"> <div class="journal-entry-pages"> <article> <section class="journal-page-content">'
+        cTag = '</section> </article> </div> </section> </div>'
         self.allPages = [oTag + x['text']['content'] + cTag for x in self.allPages]
 
+        final = ''.join(self.allPages)
+        final = self.removeEnrichers(final) 
 
         # TODO: fix this join asap
-        return ''.join(self.allPages)
+        return final
 
         
 
